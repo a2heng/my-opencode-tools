@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>OpenCode 缓存命中率</title>
+<script>
+  // 首屏前定主题，避免闪白/闪黑；system = 跟随系统
+  try {
+    const saved = localStorage.getItem("cachehit.theme") || "system"
+    document.documentElement.dataset.theme =
+      saved === "system" ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : saved
+  } catch {}
+</script>
+<style>
+  /* 深色：真正的黑底（纯黑背景 + 极低亮度面板），不是灰蓝 */
+  :root {
+    color-scheme: dark;
+    --bg: #000000;
+    --bg-soft: #050607;
+    --panel: #0b0d10;
+    --panel-hover: #14171b;
+    --panel-active: #0e1620;
+    --border: #24282e;
+    --border-soft: #171a1f;
+    --border-faint: #0d1013;
+    --text: #e9ecf0;
+    --muted: #8b939c;
+    --dim: #5d646d;
+    --ctl: #0b0d10;
+    --ctl-hover: #161a1f;
+    --box-bg: #0b0d10;
+    --box-border: #3a4048;
+    --mark-bg: #2f81f7;
+    --mark-on: #ffffff;
+    --track: #1a1e24;
+    --track-ring: #262b32;
+    --tick: rgba(255, 255, 255, .30);
+    --accent: #4d9dff;
+    --card-shadow: none;
+  }
+  /* 浅色：灰白底 + 纯白面板 + 柔和描边，避免纯白刺眼、内容突兀 */
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f1f3f6;
+    --bg-soft: #e9ecf1;
+    --panel: #ffffff;
+    --panel-hover: #f5f7fa;
+    --panel-active: #e9f2ff;
+    --border: #d3d9e1;
+    --border-soft: #e2e7ed;
+    --border-faint: #edf0f4;
+    --text: #1b2027;
+    --muted: #5c6570;
+    --dim: #8b939c;
+    --ctl: #ffffff;
+    --ctl-hover: #f0f3f7;
+    --box-bg: #ffffff;
+    --box-border: #b9c2cd;
+    --mark-bg: #0b6bcb;
+    --mark-on: #ffffff;
+    --track: #e6ebf1;
+    --track-ring: #d3d9e1;
+    --tick: rgba(0, 0, 0, .30);
+    --accent: #0b6bcb;
+    --card-shadow: 0 1px 2px rgba(16, 24, 40, .05);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex;
+    justify-content: center;
+    height: 100vh;
+    height: 100dvh;
+  }
+  /* 唯一布局：窄版单列（桌面居中，不再有宽屏双栏） */
+  .app {
+    width: 100%;
+    max-width: 760px;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border-soft);
+    border-right: 1px solid var(--border-soft);
+  }
+
+  /* ---------- 顶栏：标题 + 跟随（左侧） · 时间（中间） · 历史 + 主题（右侧） ---------- */
+  /* 三列 grid：时钟永远在正中，两侧各自靠边；不会被内容挤到左边去 */
+  header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex: 0 0 auto;
+  }
+  .brand { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  header h1 {
+    font-size: 13px;
+    margin: 0;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .clock {
+    flex: 0 0 auto;
+    font-size: 13px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    letter-spacing: .02em;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #d5372f; flex: 0 0 auto; }
+  .dot.on { background: #3fb950; }
+  .headright { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+
+  /* 复选框统一：正方形打勾，不再用胶囊按钮（省横向距离） */
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .chk input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .chk .box {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    border-radius: 4px;
+    border: 1px solid var(--box-border);
+    background: var(--box-bg);
+    display: grid;
+    place-items: center;
+    transition: background .12s, border-color .12s;
+  }
+  .chk .box::after {
+    content: "";
+    width: 8px;
+    height: 4px;
+    margin-top: -2px;
+    border-left: 2px solid var(--mark-on);
+    border-bottom: 2px solid var(--mark-on);
+    transform: rotate(-45deg) scale(0);
+    transition: transform .12s ease-out;
+  }
+  .chk input:checked + .box { background: var(--mark-bg); border-color: var(--mark-bg); }
+  .chk input:checked + .box::after { transform: rotate(-45deg) scale(1); }
+  .chk input:focus-visible + .box { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chk input:checked ~ .txt { color: var(--text); }
+  .chk:hover .box { border-color: var(--accent); }
+
+  /* 主题：文字写「主题」，点开三种 */
+  .themepick { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .themepick select {
+    height: 22px;
+    max-width: 100px;
+    padding: 0 3px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text);
+    background: var(--ctl);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .themepick select:hover { background: var(--ctl-hover); }
+  .themepick select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  main { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+
+  /* 会话条：默认只显示当前会话，勾「历史」展开全部 */
+  #sessions {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-soft);
+    padding: 6px 8px;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+  .session {
+    flex: 0 0 auto;
+    width: 172px;
+    scroll-snap-align: start;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 5px 8px;
+    border: 1px solid var(--border-soft);
+    background: var(--panel);
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .session:hover { background: var(--panel-hover); }
+  .session.active { border-color: var(--accent); background: var(--panel-active); }
+  .session .top { display: flex; align-items: baseline; gap: 6px; }
+  .session .title { flex: 1; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rate { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 14px; flex: 0 0 auto; }
+
+  #detail { flex: 1; overflow-y: auto; padding: 12px 12px 20px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .meta { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .meta .metatitle { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+  .meta .pill { flex: 0 0 auto; max-width: 52%; }
+  .bigrow { display: flex; align-items: baseline; gap: 10px; margin-top: 2px; flex-wrap: wrap; }
+  .big { font-size: 30px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .pill { font-size: 12px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+  .card { border: 1px solid var(--border); background: var(--panel); border-radius: 6px; padding: 5px 8px; box-shadow: var(--card-shadow); min-width: 0; }
+  .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .v { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--muted);
+    margin: 15px 0 6px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+  }
+  h2 .count { font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--dim); }
+
+  /* 趋势柱状图：带 50 / 70 / 95 参考刻度线（刻度与柱子共用同一套高度基准） */
+  .bars {
+    position: relative;
+    height: 84px;                /* 有刻度后给足高度，避免刻度挤在一起 */
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .bars .plot {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;                      /* 100% 的柱子直接顶到顶线 */
+    bottom: 0;
+    --gap: 4px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-start;
+    gap: var(--gap);
+  }
+  .bars .bar {
+    /* 所有柱子用同一个宽度公式：宽度完全相同，避免 flex 均分像素取整导致「有的粗有的细」 */
+    flex: 0 0 auto;
+    width: calc((100% - (var(--n) - 1) * var(--gap)) / var(--n));
+    min-width: 2px;
+    max-width: 64px;
+    border-radius: 3px 3px 0 0;
+    background: var(--c);
+    background-image: linear-gradient(to top, var(--c), color-mix(in srgb, var(--c) 88%, #ffffff));
+    opacity: .9;
+    transition: opacity .15s;
+  }
+  .bars .bar:hover { opacity: 1; }
+  .baraxis { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .baraxis .legend { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 逐步明细：时间 | 进度（带刻度） | 命中率 | token */
+  .step {
+    display: grid;
+    grid-template-columns: 58px minmax(0, 1fr) 54px 60px;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border-faint);
+    border-radius: 4px;
+  }
+  .daysep + .step { background: var(--bg-soft); }
+  .daysep {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: .05em;
+    margin: 8px 0 2px;
+    padding-top: 4px;
+    border-top: 1px dashed var(--border-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .daysep:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+  .step .time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .step .ratecell { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .step .tok { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* 进度条：底槽 + 50/70/95 刻度 + 渐变填充 */
+  .track {
+    position: relative;
+    display: block;
+    height: 7px;
+    background: var(--track);
+    border-radius: 4px;
+    box-shadow: inset 0 0 0 1px var(--track-ring);
+    overflow: hidden;            /* 100% 时填充必须贴到右端，不能被自身圆角切出灰边 */
+  }
+  .track > i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    height: 100%;
+    border-radius: 0;            /* 圆角交给外层裁切，满格才是真的满 */
+    background: var(--c);
+    background-image: linear-gradient(90deg, color-mix(in srgb, var(--c) 62%, #000000), var(--c));
+  }
+  /* 竖向刻度：正好铺满进度条高度（不溢出、不悬空） */
+  .track > .tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--tick); }
+  .empty { color: var(--muted); font-size: 12px; padding: 26px 0; text-align: center; }
+
+  @media (max-width: 560px) {
+    header { padding: 5px 8px; gap: 6px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+    .baraxis .legend { display: none; }
+    .bars .plot { --gap: 2px; }
+    .headright { gap: 8px; }
+    .themepick select { max-width: 92px; }
+    #detail { padding: 10px 8px 18px; }
+    .big { font-size: 26px; }
+    .card .v { font-size: 13px; }
+    .bars { height: 68px; }
+    .bars .plot { top: 0; }
+  }
+  @media (max-width: 400px) {
+    .chk .txt { display: none; }        /* 窄屏只留方框，靠 title 提示；字号不缩 */
+  }
+  @media (max-width: 340px) {
+    .themepick .txt { display: none; }
+    .themepick select { max-width: 88px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <span class="dot" id="dot"></span>
+      <h1>缓存命中率</h1>
+      <label class="chk" title="有新的对话或新请求时，自动跳到最新会话">
+        <input type="checkbox" id="follow" />
+        <span class="box"></span>
+        <span class="txt">跟随</span>
+      </label>
+    </div>
+    <span class="clock" id="clock">--:--:--</span>
+    <div class="headright">
+      <label class="chk" id="histLbl" title="展开最近 20 个历史会话">
+        <input type="checkbox" id="hist" />
+        <span class="box"></span>
+        <span class="txt">历史</span>
+      </label>
+      <label class="themepick" title="主题：跟随系统 / 浅色 / 深色">
+        <span class="txt">主题</span>
+        <select id="theme">
+          <option value="system">跟随系统</option>
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+        </select>
+      </label>
+    </div>
+  </header>
+  <main>
+    <div id="sessions"></div>
+    <div id="detail"><div class="empty">加载中…</div></div>
+  </main>
+</div>
+<script>
+const state = { sessions: [], selected: null, timer: null, autoFollow: true, showHistory: false }
+const el = (id) => document.getElementById(id)
+
+// —— 命中率配色：0 红 → 50 红橙 → 70 橙 → 80 琥珀 → 90 黄 → 95 绿 → 100 深绿
+// 档位：>=95 很好 / 90~95 较好 / 80~90 一般 / 70~80 偏低 / 50~70 差 / <50 很差
+// 绿色只在 >=95 出现；70~95 一律是暖色（黄/橙），一眼就能看出「不算好」
+const RATE_STOPS = [
+  [0,   [198, 44, 44]],
+  [35,  [214, 66, 40]],
+  [50,  [224, 96, 36]],
+  [65,  [229, 130, 34]],
+  [78,  [231, 163, 44]],
+  [88,  [203, 193, 50]],
+  [95,  [120, 196, 78]],
+  [100, [45, 176, 92]],
+]
+function rateColor(r) {
+  const v = Math.max(0, Math.min(100, Number(r) || 0))
+  // 浅色底上用更深的同色系，避免浅绿/浅黄在纯白上发灰看不清
+  const dim = document.documentElement.dataset.theme === "light" ? 0.72 : 1
+  for (let i = 0; i < RATE_STOPS.length - 1; i++) {
+    const [p0, c0] = RATE_STOPS[i]
+    const [p1, c1] = RATE_STOPS[i + 1]
+    if (v <= p1) {
+      const k = p1 === p0 ? 0 : (v - p0) / (p1 - p0)
+      const c = c0.map((n, j) => Math.round((n + (c1[j] - n) * k) * dim))
+      return `rgb(${c[0]}, ${c[1]}, ${c[2]})`
+    }
+  }
+  return `rgb(${Math.round(45 * dim)}, ${Math.round(176 * dim)}, ${Math.round(92 * dim)})`
+}
+function rateTier(r) {
+  if (!(r >= 0)) return ""
+  if (r >= 95) return "很好"
+  if (r >= 90) return "较好"
+  if (r >= 80) return "一般"
+  if (r >= 70) return "偏低"
+  if (r >= 50) return "差"
+  return "很差"
+}
+
+const fmt = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n)))
+const pct = (n) => n.toFixed(1) + "%"
+const pad = (n) => String(n).padStart(2, "0")
+// —— 时间口径（跨天）：步骤统一显示 HH:MM:SS，日期由分隔行/坐标轴表达
+const DAY = 86400000
+const dayStart = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+const dayDiff = (ts) => Math.round((dayStart(new Date()) - dayStart(new Date(ts))) / DAY)
+const hhmmss = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+const fmtTime = (ts) => hhmmss(new Date(ts))
+const fmtDay = (ts) => {
+  const diff = dayDiff(ts)
+  if (diff === 0) return "今天"
+  if (diff === 1) return "昨天"
+  const d = new Date(ts)
+  const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}-${md}`
+}
+const fmtStamp = (ts) => {
+  const d = new Date(ts)
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return dayDiff(ts) === 0 ? hm : `${fmtDay(ts)} ${hm}`
+}
+const fmtAgo = (ts) => {
+  if (!ts) return ""
+  const diff = dayDiff(ts)
+  if (diff === 0) return hhmmss(new Date(ts)).slice(0, 5)
+  if (diff === 1) return "昨天"
+  if (diff < 7) return diff + " 天前"
+  return fmtDay(ts)
+}
+const fmtFull = (ts) => new Date(ts).toLocaleString("zh-CN", { hour12: false })
+
+function newestId() {
+  return state.sessions.length ? state.sessions[0].id : null
+}
+
+function syncHeader() {
+  el("hist").checked = state.showHistory
+  const lbl = el("histLbl")
+  lbl.title = state.showHistory
+    ? `收起，只看当前会话（共 ${state.sessions.length} 个）`
+    : `展开最近 ${Math.min(20, state.sessions.length)} 个历史会话`
+}
+
+function renderSessions() {
+  const box = el("sessions")
+  const scrollLeft = box.scrollLeft
+  const list = state.showHistory
+    ? state.sessions.slice(0, 20)
+    : state.sessions.filter((s) => s.id === state.selected).slice(0, 1)
+  box.innerHTML = ""
+  syncHeader()
+
+  if (!list.length) {
+    const empty = document.createElement("div")
+    empty.className = "empty"
+    empty.style.padding = "4px 8px"
+    empty.textContent = state.sessions.length ? "没有会话" : "还没有会话"
+    box.appendChild(empty)
+  }
+
+  for (const s of list) {
+    const rate = s.totals ? s.totals.rate : 0
+    const node = document.createElement("div")
+    node.className = "session" + (s.id === state.selected ? " active" : "")
+    node.innerHTML = `
+      <div class="top">
+        <span class="title" title="${escapeHTML(s.title)}">${escapeHTML(s.title)}</span>
+        <span class="rate" style="color:${rateColor(rate)}">${s.totals && s.totals.steps ? pct(rate) : "-"}</span>
+      </div>
+      <div class="sub">${s.totals ? s.totals.steps + " 步 · " + fmt(s.totals.cacheRead) + " 命中" + (s.updated ? " · " + fmtAgo(s.updated) : "") : (s.error ? "读取失败" : "-")}</div>`
+    node.onclick = () => select(s.id)
+    box.appendChild(node)
+  }
+  box.scrollLeft = scrollLeft
+}
+
+function select(id) {
+  if (id === state.selected) return
+  // 用户手动回看历史时关掉自动跟随，避免立刻被拉回最新
+  if (state.autoFollow && id !== newestId()) {
+    state.autoFollow = false
+    localStorage.setItem("cachehit.follow", "0")
+    el("follow").checked = false
+  }
+  state.selected = id
+  el("detail").scrollTop = 0
+  render()
+}
+
+// 刻度：50 / 70 / 95（与配色档位一致）
+const TICKS = [50, 70, 95].map((t) => `<span class="tick" style="left:calc(${t}% - .5px)"></span>`).join("")
+
+function renderDetail() {
+  const box = el("detail")
+  const scrollTop = box.scrollTop
+  const session = state.sessions.find((s) => s.id === state.selected)
+  if (!session) { box.innerHTML = '<div class="empty">选择上方会话</div>'; return }
+  if (session.error) { box.innerHTML = `<div class="empty">读取失败：${escapeHTML(session.error)}</div>`; return }
+  const t = session.totals
+  const steps = session.lastSteps || []           // 服务端按时间正序（旧 → 新）
+  const newestFirst = steps.slice().reverse()      // 竖排列表：新的在上
+  const model = steps.length && steps[steps.length - 1].model ? steps[steps.length - 1].model : null
+  box.innerHTML = `
+    <div class="meta">
+      <span class="metatitle">${escapeHTML(session.title)}</span>
+      ${model ? `<span class="pill" title="最近一步使用的模型">${escapeHTML(model)}</span>` : ""}
+    </div>
+    <div class="bigrow">
+      <span class="big" style="color:${rateColor(t.rate)}">${t.steps ? pct(t.rate) : "--"}</span>
+      <span class="muted">${t.steps ? rateTier(t.rate) + " · 最近一步 " + pct(t.last) + " · " + t.steps + " 步" : "还没有步骤"}</span>
+    </div>
+    <div class="cards">
+      ${card("缓存读取", fmt(t.cacheRead))}
+      ${card("缓存写入", fmt(t.cacheWrite))}
+      ${card("输出", fmt(t.output))}
+      ${card("节省输入", fmt(t.cacheRead))}
+      ${card("未命中输入", fmt(t.input))}
+      ${card("花费", "$" + t.cost.toFixed(4))}
+    </div>
+    <h2>命中率趋势<span class="count">最近 ${steps.length} 步</span></h2>
+    <div class="bars">
+      <div class="plot" style="--n:${Math.max(1, steps.length)}">
+        ${steps.map((s) => `<div class="bar" title="${pct(s.rate)} · ${rateTier(s.rate)} · ${fmtFull(s.time)} · ${fmt(s.input + s.cacheRead)} tokens" style="height:${Math.max(4, Math.min(100, s.rate))}%;--c:${rateColor(s.rate)}"></div>`).join("")}
+      </div>
+    </div>
+    <div class="baraxis"><span>${steps.length ? fmtStamp(steps[0].time) : ""}</span><span class="legend">95+ 很好 · 70–95 一般 · &lt;70 差 · &lt;50 很差</span><span>${steps.length ? fmtStamp(steps[steps.length - 1].time) : ""}</span></div>
+    <h2>逐步明细<span class="count">最近 ${newestFirst.length} 步</span></h2>
+    <div>${stepRows(newestFirst.slice(0, 40))}</div>`
+  box.scrollTop = scrollTop
+}
+
+// 跨天：日期做分隔行，每行时间固定 HH:MM:SS
+// 行内顺序：时间 | 进度（带 50/70/95 刻度） | 命中率 | token 长度
+function stepRows(list) {
+  let lastDay = ""
+  let html = ""
+  for (const s of list) {
+    const day = fmtDay(s.time)
+    if (day !== lastDay) {
+      html += `<div class="daysep">${day}</div>`
+      lastDay = day
+    }
+    html += `
+      <div class="step" title="${fmtFull(s.time)}${s.model ? " · " + escapeHTML(s.model) : ""}">
+        <span class="time">${fmtTime(s.time)}</span>
+        <span class="track" title="${pct(s.rate)} · ${rateTier(s.rate)}"><i style="width:${Math.max(3, Math.min(100, s.rate))}%;--c:${rateColor(s.rate)}"></i>${TICKS}</span>
+        <span class="ratecell" style="color:${rateColor(s.rate)}">${pct(s.rate)}</span>
+        <span class="tok">${fmt(s.input + s.cacheRead)}</span>
+      </div>`
+  }
+  return html
+}
+
+function card(k, v) { return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>` }
+function escapeHTML(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])) }
+
+function render() { renderSessions(); renderDetail() }
+
+async function load() {
+  try {
+    const response = await fetch("/api/overview", { cache: "no-store" })
+    const body = await response.json()
+    if (body.error) throw new Error(body.error)
+    state.sessions = body.data
+    const previous = state.selected
+    if (state.autoFollow && state.sessions.length) {
+      // 始终跟随最新：有新对话 / 某条会话有新请求时，会话已按 updated 倒序排在第一
+      state.selected = state.sessions[0].id
+    } else if (!state.selected || !state.sessions.some((s) => s.id === state.selected)) {
+      state.selected = state.sessions.length ? state.sessions[0].id : null
+    }
+    if (state.selected !== previous) el("detail").scrollTop = 0
+    render()
+  } catch (error) {
+    const box = el("detail")
+    if (!state.sessions.length) box.innerHTML = `<div class="empty">加载失败：${escapeHTML(error.message)}</div>`
+  }
+}
+
+function schedule() {
+  clearTimeout(state.timer)
+  state.timer = setTimeout(load, 400)
+}
+
+// 自动跟随（标题右侧的方框）
+const follow = el("follow")
+state.autoFollow = localStorage.getItem("cachehit.follow") !== "0"
+follow.checked = state.autoFollow
+follow.onchange = () => {
+  state.autoFollow = follow.checked
+  localStorage.setItem("cachehit.follow", state.autoFollow ? "1" : "0")
+  if (state.autoFollow) load()
+}
+
+// 历史（顶栏右侧的方框）
+el("hist").onchange = () => {
+  state.showHistory = el("hist").checked
+  renderSessions()
+}
+
+// 主题下拉：跟随系统 / 浅色 / 深色
+const themeMedia = matchMedia("(prefers-color-scheme: light)")
+function applyTheme() {
+  const setting = localStorage.getItem("cachehit.theme") || "system"
+  const resolved = setting === "system" ? (themeMedia.matches ? "light" : "dark") : setting
+  document.documentElement.dataset.theme = resolved
+  el("theme").value = setting
+}
+themeMedia.addEventListener("change", () => {
+  if ((localStorage.getItem("cachehit.theme") || "system") === "system") applyTheme()
+})
+el("theme").onchange = () => {
+  localStorage.setItem("cachehit.theme", el("theme").value)
+  applyTheme()
+  if (state.sessions.length) render()   // 颜色深浅随主题重算
+}
+applyTheme()
+
+// 顶部时钟：每秒走一次
+const tick = () => { el("clock").textContent = hhmmss(new Date()) }
+tick()
+setInterval(tick, 1000)
+
+const stream = new EventSource("/api/stream")
+stream.onopen = () => { el("dot").classList.add("on"); load() }
+stream.onerror = () => el("dot").classList.remove("on")
+stream.onmessage = () => schedule()
+
+load()
+setInterval(() => { if (!stream.OPEN || stream.readyState !== 1) load() }, 5000)
+</script>
+</body>
+</html>

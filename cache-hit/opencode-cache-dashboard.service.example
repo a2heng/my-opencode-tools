@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenCode cache-hit dashboard (web UI)
+Documentation=file://%h/my-opencode-tools/cache-hit/README.md
+After=network-online.target opencode.service
+Wants=opencode.service
+
+[Service]
+Type=simple
+# Adjust this path if the repo is not at ~/my-opencode-tools.
+WorkingDirectory=%h/my-opencode-tools/cache-hit
+Environment=HOME=%h
+ExecStart=/usr/bin/env node %h/my-opencode-tools/cache-hit/server.mjs --port 8788 --host 0.0.0.0
+Restart=always
+RestartSec=3
+Nice=10
+
+[Install]
+WantedBy=default.target
