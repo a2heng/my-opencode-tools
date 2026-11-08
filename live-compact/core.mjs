@@ -1672,3 +1672,338 @@ function applyCut(entries, chunk, fin, opts, sessionID, shadowWriter, removed, e
   edits.set(fin.index, edit);
   return { cardTokens };
 }
+
+// ---------------------------------------------------------------------------
+// Monotonic forward transform (2026-11-08 redesign)
+//
+// The old transform re-derived every cut from the raw history on every
+// request. A new user message could move the global selection window, so an
+// older cut was no longer selected and its original content came back. The
+// forward transform removes that class of bug by construction:
+//
+//   start = the transformed output of all earlier turns (cards included)
+//   turn  = the raw messages of one finished user turn
+//   end   = the turn's final answer, kept verbatim
+//
+// A finished turn is decided once from its own frozen content and the prefix
+// before it. Appending a later turn cannot change that decision. On restart
+// the same raw history produces the same output; no state is needed.
+//
+// Leading messages (before the first user), the active turn after the last
+// user, native compaction checkpoints, and the system prompt/tools are outside
+// the cut: they are carried byte-for-byte.
+// ---------------------------------------------------------------------------
+
+function selectSegmentChunk(entries, opts) {
+  const trace = typeof opts.trace === "function" ? opts.trace : () => {};
+  const first = 0;
+  const limit = entries.length - 1;
+  if (limit < first) return null;
+
+  let end = walkOffTail(entries, limit, first);
+  if (end < first) return null;
+  while (end >= first && entries[end].card) end -= 1;
+  if (end < first) return null;
+
+  const cuttable = entries.slice(0, end + 1);
+  const longRounds = finishedToolRounds(cuttable).filter((round) => roundHasLongRead(cuttable, round));
+  const newestLong = longRounds.length ? longRounds[longRounds.length - 1] : null;
+
+  let keptTokens = 0;
+  const rounds = keptToolRounds(cuttable, opts.keepRounds || 3);
+  const span = rounds.length
+    ? chooseKeptSpan(
+        rounds,
+        (from, to) => {
+          let tokens = 0;
+          for (let index = from.start; index <= to.end; index += 1) tokens += entries[index].tokens;
+          return tokens;
+        },
+        opts.keepRoundTokens || 32000,
+      )
+    : null;
+  const cutEnd = span ? reservedCutEnd(span.start, first) : null;
+  if (span && cutEnd === null) return null;
+  if (cutEnd !== null) {
+    for (let index = span.start; index <= span.end; index += 1) keptTokens += entries[index].tokens;
+    end = cutEnd;
+    while (end >= first && (entries[end].card || entries[end].kind === "user")) end -= 1;
+    if (end < first) return null;
+    if (entries[end].nativeCheckpoint) return null;
+    const calls = indexToolIds(entries);
+    let guard = 0;
+    while (end >= first && pairingIssue(entries, first, end, calls.calls, calls.results) === "end") {
+      end -= 1;
+      guard += 1;
+      if (guard > entries.length * 4) return null;
+    }
+    if (end < first) return null;
+  }
+
+  const calls = indexToolIds(entries);
+  const balancedAfter = new Array(entries.length).fill(true);
+  let requiredUntil = -1;
+  for (let index = 0; index < entries.length; index += 1) {
+    for (const id of entries[index].toolCalls) {
+      const at = calls.results.get(id);
+      requiredUntil = Math.max(requiredUntil, at === undefined ? Number.POSITIVE_INFINITY : at);
+    }
+    balancedAfter[index] = requiredUntil <= index;
+  }
+  const items = entries.map((entry, index) => ({
+    type: entry.kind,
+    tokens: entry.tokens,
+    nativeCheckpoint: entry.nativeCheckpoint,
+    card: entry.card,
+    balancedBefore: entry.results.every((result) => {
+      const at = calls.calls.get(result.id);
+      return at !== undefined && at >= index;
+    }),
+    balancedAfter: balancedAfter[index],
+  }));
+
+  const cutOptions = {
+    engine: opts.engine,
+    chunkMin: opts.minCutTokens,
+    chunkMax: opts.maxCutTokens,
+    pointerMax: opts.pointerTokens,
+    minStart: first,
+    maxEnd: end,
+    totalTokens: opts.totalTokens,
+    drain: opts.drain,
+    urgentTokens: opts.urgentTokens,
+  };
+  let usedLongCut = false;
+  let picked = null;
+  if (newestLong) {
+    const longPicked = cutLongReadRound(items, newestLong.start, newestLong.end, cutOptions);
+    if (longPicked && longPicked.start >= newestLong.start && longPicked.end <= newestLong.end) {
+      picked = longPicked;
+      usedLongCut = true;
+    }
+  }
+  if (!picked) {
+    if (end < first || entries[end].nativeCheckpoint) return null;
+    picked = selectCutIndexes(items, cutOptions);
+  }
+  if (!picked) return null;
+
+  const sumTokens = (a, b) => {
+    let total = 0;
+    for (let index = a; index <= b; index += 1) total += entries[index].tokens;
+    return total;
+  };
+  const afterOf = (at) => {
+    let after = 0;
+    for (let index = at + 1; index < entries.length; index += 1) after += entries[index].tokens;
+    return after;
+  };
+  const spanSources = (a, b) => entries.slice(a, b + 1).flatMap((entry) => entry.sources);
+  const spanText = (a, b) => spanSources(a, b).map((source) => source.text).filter(Boolean).join("\n");
+  const liveText = (a, b) => {
+    const bits = [];
+    if (opts.prefixText) bits.push(opts.prefixText);
+    for (let index = 0; index < entries.length; index += 1) {
+      if (index >= a && index <= b) continue;
+      if (entries[index].text) bits.push(entries[index].text);
+    }
+    return bits.join("\n");
+  };
+
+  if (picked.pointerOnly) {
+    const resultAt = picked.end;
+    const result = entries[resultAt].results[0];
+    const callId = result?.id;
+    if (!callId) return null;
+    const pairStart = calls.calls.get(callId);
+    if (pairStart === undefined || pairStart > resultAt) return null;
+    if (usedLongCut && newestLong && pairStart < newestLong.start) return null;
+    if (!pointerSpanAllowed(items, pairStart, resultAt, opts.engine)) return null;
+    if (items[pairStart].balancedBefore === false) return null;
+    for (const sibling of entries[pairStart].toolCalls) {
+      if (sibling === callId) continue;
+      const at = calls.results.get(sibling);
+      if (at === undefined || at > resultAt) return null;
+    }
+    if (entries.slice(pairStart, resultAt + 1).some((entry) => entry.unsafe)) return null;
+    const sources = spanSources(pairStart, resultAt);
+    const text = `${MARKER}\n${CHECKPOINT_PREAMBLE}\n\n${pointerOnlyText(sources)}\n</live-compact>`;
+    return {
+      start: pairStart,
+      end: resultAt,
+      tokens: sumTokens(pairStart, resultAt),
+      after: afterOf(resultAt),
+      keptTokens,
+      card: { ok: true, text },
+      pointerOnly: true,
+    };
+  }
+
+  if (usedLongCut) {
+    if (!newestLong || picked.start < newestLong.start || picked.end > newestLong.end) return null;
+  } else if (picked.start < first || picked.end > end) {
+    return null;
+  }
+  if (entries[picked.start].nativeCheckpoint || entries[picked.end].nativeCheckpoint) return null;
+  if (entries.slice(picked.start, picked.end + 1).some((entry) => entry.unsafe)) return null;
+  const sources = spanSources(picked.start, picked.end);
+  const textIn = spanText(picked.start, picked.end);
+  const card = buildCard(textIn, liveText(picked.start, picked.end), sources);
+  if (!card.ok) return null;
+  const route = compactionRoute({ chars: card.spanChars, uncovered: card.uncovered });
+  if (route !== "local") return null;
+  if (sumTokens(picked.start, picked.end) < (opts.minCutTokens || 1000)) return null;
+  return {
+    start: picked.start,
+    end: picked.end,
+    tokens: sumTokens(picked.start, picked.end),
+    after: afterOf(picked.end),
+    keptTokens,
+    card,
+  };
+}
+
+function compactSegment(segment, { prefixText, prefixTokens, opts, sessionID, shadowWriter }) {
+  const entries = buildEntries(segment, opts);
+  const removed = new Set();
+  const edits = new Map();
+  let cuts = 0;
+  let cutTokens = 0;
+  let cardTokens = 0;
+
+  for (let pass = 0; pass < opts.maxPasses; pass += 1) {
+    const live = entries
+      .filter((entry) => !removed.has(entry.index))
+      .map((entry) => {
+        const edit = edits.get(entry.index);
+        if (!edit) return entry;
+        const text = edit.texts.join("\n\n");
+        return {
+          ...entry,
+          text: [text, entry.text].filter(Boolean).join("\n\n"),
+          tokens: entry.tokens + estimateTokens(text),
+          card: true,
+        };
+      });
+    const total = prefixTokens + live.reduce((sum, entry) => sum + entry.tokens, 0);
+    if (total < opts.minContextTokens || total >= opts.bigGate) break;
+    const draining = total > opts.keepRoundTokens;
+    const chunk = selectSegmentChunk(live, {
+      ...opts,
+      totalTokens: total,
+      drain: draining,
+      prefixText,
+    });
+    if (!chunk) break;
+    const tailBeyondKept = chunk.after - (chunk.keptTokens || 0);
+    if (!draining && tailBeyondKept > opts.tailTokens && total < opts.urgentTokens) break;
+    const fin = findFinalAssistant(live, chunk.start, chunk.end);
+    if (!fin) break;
+    const applied = applyCut(live, chunk, fin, opts, sessionID, shadowWriter, removed, edits);
+    if (!applied) break;
+    cuts += 1;
+    cutTokens += chunk.tokens;
+    cardTokens += applied.cardTokens;
+  }
+
+  const messages = [];
+  for (const entry of entries) {
+    if (removed.has(entry.index)) continue;
+    const edit = edits.get(entry.index);
+    messages.push(edit ? withCheckpoint(entry.message, edit.texts) : entry.message);
+  }
+  const text = messages.map(messageText).join("\n");
+  return { messages, cuts, cutTokens, cardTokens, text, tokens: estimateTokens(text) };
+}
+
+export function compactMessagesForward(
+  messages,
+  { sessionID = "", options = {}, shadowWriter, engine } = {},
+) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  if (engine && opts.engine === "auto") opts.engine = engine;
+  const resolvedEngine = opts.engine === "local" || opts.engine === "cloud" ? opts.engine : "cloud";
+  const segmentOpts = { ...opts, engine: resolvedEngine };
+
+  const out = [];
+  let prefixText = "";
+  let prefixTokens = 0;
+  let cuts = 0;
+  let cutTokens = 0;
+  let cardTokens = 0;
+  const totalBefore = messages.reduce((sum, message) => sum + estimateTokens(messageText(message)), 0);
+
+  const appendRaw = (items) => {
+    for (const message of items) {
+      out.push(message);
+      const text = messageText(message);
+      if (text) prefixText = prefixText ? `${prefixText}\n${text}` : text;
+      prefixTokens += estimateTokens(text);
+    }
+  };
+
+  let index = 0;
+  while (index < messages.length) {
+    const message = messages[index];
+    if (message?.role !== "user") {
+      appendRaw([message]);
+      index += 1;
+      continue;
+    }
+
+    let next = index + 1;
+    while (next < messages.length && messages[next]?.role !== "user") next += 1;
+    const segment = messages.slice(index + 1, next);
+
+    if (next >= messages.length) {
+      // The active turn: never cut until a later user message arrives.
+      appendRaw(messages.slice(index));
+      break;
+    }
+
+    const userText = messageText(message);
+    const userTokens = estimateTokens(userText);
+    const segmentText = segment.map(messageText).filter(Boolean).join("\n");
+    const segmentTokens = estimateTokens(segmentText);
+    const turnPrefixText = prefixText ? `${prefixText}\n${userText}` : userText;
+    const turnPrefixTokens = prefixTokens + userTokens;
+
+    let result;
+    if (turnPrefixTokens + segmentTokens < opts.minContextTokens || turnPrefixTokens + segmentTokens >= opts.bigGate) {
+      result = {
+        messages: segment,
+        cuts: 0,
+        cutTokens: 0,
+        cardTokens: 0,
+        text: segmentText,
+        tokens: segmentTokens,
+      };
+    } else {
+      result = compactSegment(segment, {
+        prefixText: turnPrefixText,
+        prefixTokens: turnPrefixTokens,
+        opts: segmentOpts,
+        sessionID,
+        shadowWriter,
+      });
+    }
+
+    out.push(message, ...result.messages);
+    prefixText = result.text ? `${turnPrefixText}\n${result.text}` : turnPrefixText;
+    prefixTokens = turnPrefixTokens + result.tokens;
+    cuts += result.cuts;
+    cutTokens += result.cutTokens;
+    cardTokens += result.cardTokens;
+    index = next;
+  }
+
+  return {
+    messages: out,
+    cuts,
+    cutTokens,
+    cardTokens,
+    totalBefore,
+    totalAfter: prefixTokens,
+    engine: resolvedEngine,
+  };
+}

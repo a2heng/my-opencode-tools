@@ -8,7 +8,7 @@ touching anything before the cut. The provider's prefix cache keeps hitting.
 This project is unofficial and not affiliated with the original author.
 
 **Stable version:** OpenCode port of dsh-live-compact 1.1.1 (2026-11-08).
-31 unit/hook cases plus a free-model end-to-end test; see [Test](#test).
+40 unit/hook cases plus a free-model end-to-end test; see [Test](#test).
 
 ## Principle
 
@@ -64,21 +64,31 @@ bytes and hit the provider cache. A plugin reload or server restart also costs
 one one-time miss. Measured after the fix: the main session returned to
 **99.5–99.9%**, with a single 93.5% blip on a new finished-turn cut.
 
-### Sticky cut plan
+### Monotonic forward transform
 
-Re-deriving every cut from the raw history on every request had one failure
-mode: when a new user message arrived, the global selection window could move
-and an older cut was no longer selected, so its original content came back into
-the context. That is what caused the 12:25:04 miss: an earlier `69,103 -> 10,563`
-cut disappeared, the effective prefix grew from ~96k back to ~155k, and the
-request had to re-prefill 158k tokens.
+The transform is a forward pass over finished turns. The **start content** is
+the transformed output of all earlier turns (old cards included), not the raw
+history. For each finished turn:
 
-The plugin now keeps a per-session **sticky plan**: the exact outgoing message
-list from the previous request. If the new raw history is append-only, it reuses
-that list (including every old card) and only transforms the new tail. An older
-cut can never be un-cut by a later turn. If the raw prefix is rewritten (a
-native compaction, an edit, or a restart), the plan is dropped and rebuilt; that
-costs one full re-prefill, which is the only unavoidable cold-start miss.
+- its raw segment is frozen (it has a later user message);
+- the decision uses only `prefixTokens + this turn's tokens`;
+- the newest `keepRounds` tool rounds of **that turn** stay verbatim; older
+  rounds in that turn may be cut;
+- the active turn after the last user message is appended raw and never cut;
+- leading messages (before the first user) and native compaction checkpoints
+  are carried byte-for-byte.
+
+Appending turn N+1 cannot change turn N's decision, because turn N's prefix
+and segment are already frozen. On restart the same raw history produces the
+same output; there is no in-memory plan to lose. The trade-off is per-turn
+keeping: a turn with <= `keepRounds` rounds is not cut on its own (native
+compaction remains the backstop). If a raw prefix is rewritten by a native
+compaction or an edit, the forward pass starts from the new raw and pays one
+re-prefill.
+
+This replaces the earlier global re-derivation, which could drop an older cut
+when a new user message moved the selection window (the 12:25:04 case where a
+`69,103 -> 10,563` cut disappeared and ~59k of old content came back).
 
 Measured free-model e2e (`mimo-v2.6-flash-free`, 2026-11-08): a 13,649-token
 read result became a 401-token card (**2.9%**, 13,248 tokens saved; effective
@@ -120,7 +130,7 @@ result arrives while the model is still working, the cut must not move.
 The selector walks backward from the final answer:
 
 1. skip the running turn (after the last user message);
-2. keep the newest 3 finished tool rounds verbatim;
+2. keep the newest 3 tool rounds of that turn verbatim;
 3. take the newest bulky spans immediately before the final answer;
 4. refuse the cut if a hard fact would be lost, if a tool call/result would
    be split, or if the span is mostly unclassified prose (wait-80);
@@ -252,7 +262,7 @@ The test cases are the versioned assets; `test.sh` is only the runner.
 
 ```sh
 cd live-compact
-./test.sh              # 31 unit/hook/engine/card/selection cases
+./test.sh              # 40 unit/hook/engine/card/selection/forward cases
 E2E_FREE=1 ./test.sh   # + real OpenCode run with a free model
 ```
 
@@ -260,8 +270,9 @@ E2E_FREE=1 ./test.sh   # + real OpenCode run with a free model
 |---|---:|---|
 | `tests/engine.test.mjs` | 4 | local/cloud endpoint classification, env override, unknown endpoint |
 | `tests/card.test.mjs` | 7 | digest extraction, hard-line coverage, assistant decision veto, tool excerpts, pointers |
-| `tests/select.test.mjs` | 15 | kept rounds, long-read, pointer cards, cloud/local modes, drain, 650k stopline, tool pairing, wait-80, determinism, **active-turn prefix stability** |
-| `tests/hook.test.mjs` | 5 | hook wiring, shadow files, provider failure fallback, per-session engine resolution |
+| `tests/select.test.mjs` | 15 | legacy global selector: kept rounds, long-read, pointer cards, cloud/local modes, drain, 650k stopline, tool pairing, wait-80, determinism |
+| `tests/forward.test.mjs` | 6 | **active monotonic transform**: determinism, restart, new user turn, old card never un-cut, per-turn kept rounds |
+| `tests/hook.test.mjs` | 8 | hook wiring, shadow files, provider failure fallback, per-session engine resolution, monotonic re-use |
 | `tests/helpers.mjs` | — | message builders and assertion helpers |
 | `e2e/free-model.sh` | 1 | real free-model run: tool call, cut, shadow, reduction, second-request cache hit |
 
