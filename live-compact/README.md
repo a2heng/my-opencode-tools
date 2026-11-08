@@ -69,6 +69,126 @@ read result became a 401-token card (**2.9%**, 13,248 tokens saved; effective
 13,727 -> 479). Live finished-turn cuts measured 15.6–32.7% card/span
 (e.g. 2,224 -> 436, 4,677 -> 1,531, 6,895 -> 1,791, 28,529 -> 4,462).
 
+## Walkthrough: one cut, step by step
+
+> The task, file names, commands, ids and token counts below are a made-up
+> example. The shape of the cut and the card is what matters.
+
+### The situation
+
+Turn 7 is a "make the worker start" turn. It has 24 shell calls: compile,
+smoke-test, edit, retry, read logs, and so on. The final answer is written;
+turn 8 (the current turn) has already started.
+
+```text
+turn 7 (finished)                                    turn 8 (active)
+┌──────────────────────────────────────────────┐    ┌─────────────────────┐
+│ user: "make the worker start"                │    │ user: "next task"   │
+│ assistant: compile -> OK                     │    │ assistant: working  │
+│ assistant: smoke test -> ERROR out of memory │    │ ...                 │
+│ ... 22 more shell calls ...                  │    │                     │
+│ assistant: final answer                      │    │                     │
+└──────────────────────────────────────────────┘    └─────────────────────┘
+```
+
+Only turn 7 is eligible. The running turn 8 is never touched: if a tool
+result arrives while the model is still working, the cut must not move.
+
+### What is chosen
+
+```text
+[user turn 7] [call 1 + result] [call 2 + result] ... [final answer] [user turn 8] [active...]
+                              └──── 3 bulky spans, ~28.5k tokens ────┘
+```
+
+The selector walks backward from the final answer:
+
+1. skip the running turn (after the last user message);
+2. keep the newest 3 finished tool rounds verbatim;
+3. take the newest bulky spans immediately before the final answer;
+4. refuse the cut if a hard fact would be lost, if a tool call/result would
+   be split, or if the span is mostly unclassified prose (wait-80);
+5. extract the card locally; no model call.
+
+### What the card looks like
+
+```text
+<live-compact>
+Live Compact extract (Spine 1.1.1 semantics).
+TRUNK CONFIRMED.
+Matched lines: 0. Missing facts: 0. Ordinary tool lines omitted: 240.
+Kept lines:
+- (none)
+Tool evidence:
+- turn 7 `python scripts/smoke.py` failed [call_a2]
+- turn 7 `python -m compileall src/worker.py` exit 0 [call_a1]
+... 18 tool evidence lines
+Original pointers:
+- * shell "python scripts/smoke.py" (seq msg_a2 -> result msg_b2)
+... 18 pointers
+[tool] ... a short excerpt of the failed output ...
+[tool] 11 more call(s) not excerpted
+Full shadowed text: ~/.local/share/opencode/live-compact/shadow/<session>-<hash>.txt
+</live-compact>
+```
+
+The card keeps the **facts** (which command ran, whether it failed, the call
+id), the **pointers** (where the original output lives), and a few **short
+excerpts**. It does not keep 240 lines of repeated build logs.
+
+### Before and after
+
+```text
+before:
+┌──────────────────────────────────────────────────────────────┐
+│ turn 7: 24 shell calls + bulky output                        │
+│ 3 spans, ~28.5k tokens                                       │
+└──────────────────────────────────────────────────────────────┘
+                    │ local extraction (no model call)
+                    ▼
+after:
+┌──────────────────────────────────────────────────────────────┐
+│ 📌 card, ~4.5k tokens                                        │
+│  • tool evidence: command + exit status + call id            │
+│  • original pointers: call seq -> result seq                 │
+│  • short excerpts: the failure and the last lines            │
+│  • 240 ordinary lines omitted                                │
+│  • original text in the shadow file                          │
+└──────────────────────────────────────────────────────────────┘
+final answer is kept; the card is attached to it
+```
+
+Illustrative arithmetic: ~28.5k -> ~4.5k, about 84% of the cut span removed.
+The effective context in the request drops by about 24k tokens.
+
+### Why the cache survives
+
+```text
+request N:     [========== prefix, unchanged ==========][cut span + tail]   one miss
+request N+1:   [========== prefix, unchanged ==========][only new work]     ~99%
+request N+2:   [========== prefix, unchanged ==========][only new work]     ~99%
+```
+
+The bytes before the cut never change. The first request after a cut pays one
+miss for the cut span, the kept answer and the new user message; later
+requests reuse the compacted prefix.
+
+The card itself is deterministic: same frozen span, same extracted lines, same
+content-hash shadow filename. That is why appending new turns or new tool
+results does not move an older card.
+
+### What can go wrong
+
+- The cut touches the **running** turn: every tool round grows the span, the
+  prefix changes, and the hit rate falls to the uncached share. This port now
+  refuses that case (`last user` boundary).
+- A plugin reload or server restart costs one full re-prefill; that is a
+  one-time miss, not a steady state.
+- A hard line that cannot be kept refuses the cut (`TRUNK UNCONFIRMED`); the
+  span stays live and native compaction remains the backstop.
+- A single enormous turn is not cut until it finishes. The active turn can
+  still be large; that is the price of a stable prefix.
+
 ## Config
 
 Global config `~/.config/opencode/opencode.json`:
