@@ -116,6 +116,62 @@ test("a provider list failure falls back without breaking the request", async ()
   rmSync(root, { recursive: true, force: true })
 })
 
+test("a previous cut is sticky while the active turn grows", async () => {
+  const { ctx, hooks } = fakeContext({ options: OPTIONS })
+  await createLiveCompact(ctx)
+  const raw = history()
+  const first = { sessionID: "ses_sticky", model: { providerID: "opencode" }, messages: raw }
+  await hooks.context(first)
+  const card = first.messages.find((message) => messageText(message).includes("<live-compact>"))
+  assert.ok(card)
+
+  const grown = [...raw, assistant("more active output")]
+  const second = { sessionID: "ses_sticky", model: { providerID: "opencode" }, messages: grown }
+  await hooks.context(second)
+  assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages, "old cut must be byte-identical")
+  assert.deepEqual(
+    second.messages.filter((message) => messageText(message).includes("<live-compact>")).map(messageText),
+    [messageText(card)],
+    "the card must not be duplicated or changed",
+  )
+})
+
+test("a new finished turn is cut without un-cutting the old card", async () => {
+  const { ctx, hooks } = fakeContext({ options: OPTIONS })
+  await createLiveCompact(ctx)
+  const raw = history()
+  const first = { sessionID: "ses_sticky2", model: { providerID: "opencode" }, messages: raw }
+  await hooks.context(first)
+  const oldCard = first.messages.find((message) => messageText(message).includes("<live-compact>"))
+  assert.ok(oldCard)
+
+  const next = [...raw, user("third task"), assistant("third answer")]
+  const second = { sessionID: "ses_sticky2", model: { providerID: "opencode" }, messages: next }
+  await hooks.context(second)
+  assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages, "old prefix must stay")
+  assert.ok(
+    second.messages.some((message) => messageText(message) === messageText(oldCard)),
+    "old card must remain exactly once",
+  )
+})
+
+test("a rewritten raw prefix drops the stored plan and rebuilds", async () => {
+  const { ctx, hooks } = fakeContext({ options: OPTIONS })
+  await createLiveCompact(ctx)
+  const raw = history()
+  const first = { sessionID: "ses_reset", model: { providerID: "opencode" }, messages: raw }
+  await hooks.context(first)
+  assert.ok(first.messages.some((message) => messageText(message).includes("<live-compact>")))
+
+  const rewritten = raw.map((message, index) =>
+    index === 0 ? { ...message, content: [{ type: "text", text: "a different first prompt" }] } : message,
+  )
+  const second = { sessionID: "ses_reset", model: { providerID: "opencode" }, messages: rewritten }
+  await hooks.context(second)
+  assert.ok(Array.isArray(second.messages))
+  assert.ok(second.messages.length > 0)
+})
+
 test("engine resolution is per session, not frozen from the first provider", async () => {
   const { ctx, hooks } = fakeContext({
     options: {

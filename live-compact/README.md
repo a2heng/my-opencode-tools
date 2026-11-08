@@ -64,6 +64,22 @@ bytes and hit the provider cache. A plugin reload or server restart also costs
 one one-time miss. Measured after the fix: the main session returned to
 **99.5–99.9%**, with a single 93.5% blip on a new finished-turn cut.
 
+### Sticky cut plan
+
+Re-deriving every cut from the raw history on every request had one failure
+mode: when a new user message arrived, the global selection window could move
+and an older cut was no longer selected, so its original content came back into
+the context. That is what caused the 12:25:04 miss: an earlier `69,103 -> 10,563`
+cut disappeared, the effective prefix grew from ~96k back to ~155k, and the
+request had to re-prefill 158k tokens.
+
+The plugin now keeps a per-session **sticky plan**: the exact outgoing message
+list from the previous request. If the new raw history is append-only, it reuses
+that list (including every old card) and only transforms the new tail. An older
+cut can never be un-cut by a later turn. If the raw prefix is rewritten (a
+native compaction, an edit, or a restart), the plan is dropped and rebuilt; that
+costs one full re-prefill, which is the only unavoidable cold-start miss.
+
 Measured free-model e2e (`mimo-v2.6-flash-free`, 2026-11-08): a 13,649-token
 read result became a 401-token card (**2.9%**, 13,248 tokens saved; effective
 13,727 -> 479). Live finished-turn cuts measured 15.6–32.7% card/span

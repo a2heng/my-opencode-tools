@@ -39,6 +39,19 @@ const ENV_OPTIONS = {
   maxPasses: "OPENCODE_LIVE_COMPACT_MAX_PASSES",
 }
 
+function hashMessages(messages) {
+  const hash = createHash("sha256")
+  for (const message of messages) {
+    hash.update(message?.id ?? "")
+    hash.update("\0")
+    hash.update(message?.role ?? "")
+    hash.update("\0")
+    hash.update(JSON.stringify(message?.content ?? []))
+    hash.update("\n")
+  }
+  return hash.digest("hex")
+}
+
 function shadowKey(sessionID, spanText) {
   const hash = createHash("sha256").update(spanText).digest("hex").slice(0, 16)
   const tag = String(sessionID ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(-24) || "session"
@@ -116,6 +129,10 @@ export async function createLiveCompact(ctx) {
   let debugged = false
   let providerURLs = null
   const engineLogged = new Set()
+  // Sticky cut plan per session: the exact outgoing messages of the previous
+  // request. Reusing them prevents an older cut from being un-cut when a new
+  // user message shifts the selection window (the 12:25 regression).
+  const sessionPlans = new Map()
 
   const registration = await ctx.session.hook("context", async (event) => {
     const started = Date.now()
@@ -155,18 +172,43 @@ export async function createLiveCompact(ctx) {
         }
       }
 
-      const result = compactMessages(event.messages, {
-        sessionID: String(event.sessionID ?? ""),
+      const sid = String(event.sessionID ?? "")
+      const rawMessages = event.messages
+      const plan = sessionPlans.get(sid)
+      let transformInput = rawMessages
+      let reused = false
+      if (plan && rawMessages.length >= plan.rawLength) {
+        const prefixHash = hashMessages(rawMessages.slice(0, plan.rawLength))
+        if (prefixHash === plan.rawHash) {
+          // Append-only: keep the exact outgoing prefix (including old cards)
+          // and only transform the new tail. A previous cut can never be
+          // un-cut by a later turn.
+          transformInput = [...plan.out, ...rawMessages.slice(plan.rawLength)]
+          reused = true
+        }
+      }
+
+      const result = compactMessages(transformInput, {
+        sessionID: sid,
         options,
         engine: resolvedEngine,
         shadowWriter: writeShadow,
       })
+      // Even with no new cut, the outgoing list may contain cards from the
+      // stored plan; send it, or those cards disappear from the prefix.
+      event.messages = result.messages
+      sessionPlans.set(sid, {
+        rawLength: rawMessages.length,
+        rawHash: hashMessages(rawMessages),
+        out: result.messages,
+      })
+
       if (result.cuts > 0) {
-        event.messages = result.messages
         console.log(
           `[${PLUGIN_ID}] cut ${result.cuts} span(s) in ${Date.now() - started}ms ` +
             `${result.cutTokens} -> ${result.cardTokens} tokens ` +
-            `effective ${result.totalBefore} -> ${result.totalAfter} engine=${result.engine} session=${event.sessionID}`,
+            `effective ${result.totalBefore} -> ${result.totalAfter} engine=${result.engine} ` +
+            `state=${reused ? "reuse" : "rebuild"} session=${event.sessionID}`,
         )
         if (debug) {
           try {
@@ -180,6 +222,7 @@ export async function createLiveCompact(ctx) {
                 totalBefore: result.totalBefore,
                 totalAfter: result.totalAfter,
                 engine: result.engine,
+                state: reused ? "reuse" : "rebuild",
                 ms: Date.now() - started,
               })}\n`,
             )
