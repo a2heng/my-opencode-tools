@@ -7,6 +7,9 @@ touching anything before the cut. The provider's prefix cache keeps hitting.
 
 This project is unofficial and not affiliated with the original author.
 
+**Stable version:** OpenCode port of dsh-live-compact 1.1.1 (2026-11-08).
+31 unit/hook cases plus a free-model end-to-end test; see [Test](#test).
+
 ## Principle
 
 DSH compacts at ~80% with a model call. Live Compact does not wait: once the
@@ -50,9 +53,21 @@ requests hit the compacted prefix. Turns that were small when they finished are
 never retroactively cut, because the pressure gate uses the prefix at the
 moment the turn becomes finished.
 
-Measured on a real OpenCode + DeepSeek run: after a 2,076-token cut, the next
-request read 22,784 tokens from cache and only 354 tokens were uncached
-(~98.5% hit). See `e2e/README.md`.
+Only the turn before the last user message is eligible. The active turn is
+never touched: if a tool result arrives while the model is still working, the
+cut must not move. This is the difference between a stable prefix and the
+2026-11-08 cache drop (the old selector cut the running turn, so every tool
+round rewrote the prefix and the hit rate sat at ~72%).
+
+One cut is paid once, when a turn finishes; later requests reproduce the same
+bytes and hit the provider cache. A plugin reload or server restart also costs
+one one-time miss. Measured after the fix: the main session returned to
+**99.5–99.9%**, with a single 93.5% blip on a new finished-turn cut.
+
+Measured free-model e2e (`mimo-v2.6-flash-free`, 2026-11-08): a 13,649-token
+read result became a 401-token card (**2.9%**, 13,248 tokens saved; effective
+13,727 -> 479). Live finished-turn cuts measured 15.6–32.7% card/span
+(e.g. 2,224 -> 436, 4,677 -> 1,531, 6,895 -> 1,791, 28,529 -> 4,462).
 
 ## Config
 
@@ -97,19 +112,31 @@ Environment overrides (useful for testing without touching global config):
 
 ## Test
 
+The test cases are the versioned assets; `test.sh` is only the runner.
+
 ```sh
 cd live-compact
-node test.mjs        # 10 core cases
-node test-hook.mjs   # full hook wiring + shadow + cache stability
+./test.sh              # 31 unit/hook/engine/card/selection cases
+E2E_FREE=1 ./test.sh   # + real OpenCode run with a free model
 ```
 
-The core cases cover: no-op on small history, cut on a finished bulky turn,
-byte stability while the active turn grows, stability after a new turn
-finishes, tool pairing, no-op on already-compacted input, determinism,
-shrink-to-confirmable-span, the prose wait-80 gate, and the long-tail gate.
+| File | Cases | What it locks down |
+|---|---:|---|
+| `tests/engine.test.mjs` | 4 | local/cloud endpoint classification, env override, unknown endpoint |
+| `tests/card.test.mjs` | 7 | digest extraction, hard-line coverage, assistant decision veto, tool excerpts, pointers |
+| `tests/select.test.mjs` | 15 | kept rounds, long-read, pointer cards, cloud/local modes, drain, 650k stopline, tool pairing, wait-80, determinism, **active-turn prefix stability** |
+| `tests/hook.test.mjs` | 5 | hook wiring, shadow files, provider failure fallback, per-session engine resolution |
+| `tests/helpers.mjs` | — | message builders and assertion helpers |
+| `e2e/free-model.sh` | 1 | real free-model run: tool call, cut, shadow, reduction, second-request cache hit |
 
-The real end-to-end procedure and measured cache numbers are in
-`e2e/README.md`.
+The old `test.mjs` / `test-hook.mjs` from the 1.0.1 port were moved into the
+files above (the git history keeps the old copies). Nothing was dropped; the
+coverage was split so a failure names the layer that broke.
+
+`e2e/free-model.sh` refuses a model id without `free` unless
+`LC_E2E_ALLOW_PAID=1` is set. The default is
+`opencode/mimo-v2.6-flash-free`: this project tests compaction, not model
+capability, so the cheapest free model is the right one.
 
 ## Logs and shadow
 
