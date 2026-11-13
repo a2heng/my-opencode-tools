@@ -1,4 +1,12 @@
-# Live Compact for OpenCode
+# Live Compact for OpenCode (legacy)
+
+> **Superseded 2026-11-13.** The deployed plugin is now the upstream port in
+> [`vendor/opencode-live-compact`](../vendor/opencode-live-compact)
+> ([Haoming9527/opencode-live-compact](https://github.com/Haoming9527/opencode-live-compact),
+> MIT): it persists the shortened window, archives every original for exact
+> recall, and has 121 unit + 10 stock-OpenCode integration tests. This directory
+> is kept for reference and for the monotonic-cut design history; it is no
+> longer loaded by `~/.config/opencode/opencode.json`.
 
 An independent OpenCode V2 port of
 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact) by Merkyor

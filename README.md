@@ -4,26 +4,37 @@
 
 | 目录 | 类型 | 作用 |
 | --- | --- | --- |
-| [`live-compact/`](live-compact/) | **插件**（V2 `session.hook("context")`） | 每轮结束后就地压缩刚完成的 turn，切点之前的字节完全不动，保住 provider 的 prefix cache；全程不调模型 |
+| [`vendor/opencode-live-compact/`](vendor/opencode-live-compact/) | **插件**（git submodule，MIT） | **当前部署**：上游 [Haoming9527/opencode-live-compact](https://github.com/Haoming9527/opencode-live-compact)。完成回合后就地缩短历史，原文归档、可 `live_compact_recall` 回读；全程不调模型 |
+| [`live-compact/`](live-compact/) | **旧插件**（留档） | 我们自己写的 V2 `session.hook("context")` 移植（单调切分）。2026-11-13 起不再部署，保留作对照 |
 | [`cache-hit/`](cache-hit/) | **Web 看板**（零依赖 Node） | 浏览器里实时查看各会话的提示词缓存命中率、每步 tokens 与花费 |
 
-## live-compact —— 插件
+## vendor/opencode-live-compact —— 当前插件
 
-把 `live-compact/` 放到任意目录，然后在 `~/.config/opencode/opencode.json` 里用**绝对路径**注册：
+[上游 OpenCode 移植](https://github.com/Haoming9527/opencode-live-compact)（DSH Live Compact 作者
+在 README 里点名的实现，MIT）。submodule 钉在 `19a3faa`（npm `0.1.2`），构建产物不入库，
+首次使用要装依赖并编译：
+
+```bash
+git submodule update --init --recursive
+cd vendor/opencode-live-compact
+npm ci && npm run build          # 需要 Node >= 22.18；npm test 需要 Node 24
+```
+
+然后在 `~/.config/opencode/opencode.json` 里用**绝对路径**注册：
 
 ```jsonc
 {
   "plugins": [
-    {
-      "package": "/path/to/live-compact",
-      "options": { "minContextTokens": 20000, "keepChars": 8000, "shadow": true }
-    }
+    { "package": "/path/to/my-opencode-tools/vendor/opencode-live-compact" }
   ]
 }
 ```
 
-它只改**发出去的那一次请求**，不写会话历史；被切掉的原文写到 shadow 文件，随时可删。
-原理、全部选项、测试与回滚见 [`live-compact/README.md`](live-compact/README.md)。
+默认参数：20k 上下文起评、单刀至少 1k 源 tokens、每轮最多 3 刀、保护最近 3 个工具轮；
+归档在 `~/.local/state/opencode-live-compact`（默认 256 MiB）。它会改写**已保存的**会话窗口，
+但每个 cut 都先备份原文；备份失败/前缀变化/容量不足时保留全文、不写摘要。另提供
+`live_compact_status` / `live_compact_recall` 两个工具。切换记录见
+[`../agent-records/2026-11-13-switch-to-upstream-opencode-live-compact.md`](../agent-records/2026-11-13-switch-to-upstream-opencode-live-compact.md)。
 
 ## cache-hit —— Web 看板
 
