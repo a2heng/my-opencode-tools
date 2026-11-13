@@ -1,3 +1,3 @@
-[submodule "vendor/opencode-live-compact"]
-	path = vendor/opencode-live-compact
+[submodule "opencode-live-compact"]
+	path = opencode-live-compact
 	url = https://github.com/Haoming9527/opencode-live-compact.git

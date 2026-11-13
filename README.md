@@ -1,14 +1,13 @@
 # my-opencode-tools
 
-给 [OpenCode](https://opencode.ai) 用的两个独立工具，一个插件、一个 Web 看板，互不依赖：
+给 [OpenCode](https://opencode.ai) 用的两个独立工具：
 
 | 目录 | 类型 | 作用 |
 | --- | --- | --- |
-| [`vendor/opencode-live-compact/`](vendor/opencode-live-compact/) | **插件**（git submodule，MIT） | **当前部署**：上游 [Haoming9527/opencode-live-compact](https://github.com/Haoming9527/opencode-live-compact)。完成回合后就地缩短历史，原文归档、可 `live_compact_recall` 回读；全程不调模型 |
-| [`live-compact/`](live-compact/) | **旧插件**（留档） | 我们自己写的 V2 `session.hook("context")` 移植（单调切分）。2026-11-13 起不再部署，保留作对照 |
+| [`opencode-live-compact/`](opencode-live-compact/) | **插件**（git submodule，MIT） | 上游 [Haoming9527/opencode-live-compact](https://github.com/Haoming9527/opencode-live-compact)。完成回合后就地缩短历史，原文归档、可 `live_compact_recall` 回读；全程不调模型 |
 | [`cache-hit/`](cache-hit/) | **Web 看板**（零依赖 Node） | 浏览器里实时查看各会话的提示词缓存命中率、每步 tokens 与花费 |
 
-## vendor/opencode-live-compact —— 当前插件
+## opencode-live-compact —— 插件
 
 [上游 OpenCode 移植](https://github.com/Haoming9527/opencode-live-compact)（DSH Live Compact 作者
 在 README 里点名的实现，MIT）。submodule 钉在 `19a3faa`（npm `0.1.2`），构建产物不入库，
@@ -16,7 +15,7 @@
 
 ```bash
 git submodule update --init --recursive
-cd vendor/opencode-live-compact
+cd opencode-live-compact
 npm ci && npm run build          # 需要 Node >= 22.18；npm test 需要 Node 24
 ```
 
@@ -25,7 +24,7 @@ npm ci && npm run build          # 需要 Node >= 22.18；npm test 需要 Node 2
 ```jsonc
 {
   "plugins": [
-    { "package": "/path/to/my-opencode-tools/vendor/opencode-live-compact" }
+    { "package": "/path/to/my-opencode-tools/opencode-live-compact" }
   ]
 }
 ```
@@ -59,5 +58,6 @@ node server.mjs --port 8788
 
 ## License
 
-[MIT](LICENSE)。`live-compact` 是 [dsh-live-compact](https://github.com/MerkyorLynn/dsh-live-compact)
-（MIT，Copyright © 2026 Merkyor）的 OpenCode 移植，保留原作者版权声明。
+[MIT](LICENSE)。`opencode-live-compact/` 是上游
+[Haoming9527/opencode-live-compact](https://github.com/Haoming9527/opencode-live-compact)
+（MIT）的 git submodule，版权归原作者；`cache-hit/` 亦为 MIT。
